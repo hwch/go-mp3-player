@@ -107,9 +107,12 @@ import (
         "container/list"
         "flag"
         "fmt"
+        "math/rand"
         "os"
         "path/filepath"
+        "runtime/debug"
         "sync"
+        "time"
         "unsafe"
 )
 
@@ -117,6 +120,7 @@ const MP3_FILE_MAX = 10
 
 var g_list *list.List
 var g_wg *sync.WaitGroup
+var g_isOutOfOrder bool
 
 func GString(s string) *C.gchar {
         return (*C.gchar)(C.CString(s))
@@ -143,8 +147,41 @@ func walkFunc(fpath string, info os.FileInfo, err error) error {
         default:
                 return nil
         }
+
         g_list.PushBack(fpath)
         return err
+}
+
+func outOfOrder(l *list.List) {
+        iTotal := 5
+        ll := make([]*list.List, iTotal)
+
+        for i := 0; i < iTotal; i++ {
+                ll[i] = list.New()
+        }
+        r := rand.New(rand.NewSource(time.Now().UnixNano()))
+        for e := l.Front(); e != nil; e = e.Next() {
+                fpath, ok := e.Value.(string)
+                if !ok {
+                        panic("The path is invalid string")
+                }
+                if rand.Int()%2 == 0 {
+                        ll[r.Intn(iTotal)].PushFront(fpath)
+                } else {
+                        ll[r.Intn(iTotal)].PushBack(fpath)
+                }
+        }
+
+        r0 := rand.New(rand.NewSource(time.Now().UnixNano()))
+        l.Init()
+        for i := 0; i < iTotal; i++ {
+                if r0.Intn(2) == 0 {
+                        l.PushBackList(ll[i])
+                } else {
+                        l.PushFrontList(ll[i])
+                }
+                ll[i].Init()
+        }
 }
 
 func mp3_play_process(cs chan byte, loop *C.GMainLoop) {
@@ -155,6 +192,10 @@ func mp3_play_process(cs chan byte, loop *C.GMainLoop) {
         defer close(sig_in)
         defer close(sig_out)
         defer g_wg.Done()
+        if g_isOutOfOrder {
+                outOfOrder(g_list)
+                debug.FreeOSMemory()
+        }
         start := g_list.Front()
         end := g_list.Back()
         e := g_list.Front()
@@ -316,6 +357,7 @@ func main() {
         mdir := ""
 
         flag.StringVar(&mdir, "mdir", "", "mp3文件目录")
+        flag.BoolVar(&g_isOutOfOrder, "rand", false, "是否乱序播放")
         flag.Parse()
 
         if mdir == "" {
