@@ -2,23 +2,6 @@ package main
 
 /*
 #cgo pkg-config: gstreamer-1.0
-
-#include <linux/fb.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <time.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <string.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <math.h>
-#include <stdio.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <glib.h>
 #include <gst/gst.h>
 
 
@@ -31,18 +14,15 @@ gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data)
 
         switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_EOS:
-                // g_print("End of stream\n");
                 g_main_loop_quit(loop);
                 break;
         case GST_MESSAGE_ERROR:
-
                 gst_message_parse_error(msg,&error,&debug);
                 g_free(debug);
                 g_printerr("ERROR:%s\n",error->message);
                 g_error_free(error);
                 g_main_loop_quit(loop);
                 break;
-
         default:
                 break;
         }
@@ -50,30 +30,21 @@ gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data)
         return TRUE;
 }
 
-static void obj_set(void *d, void *s0, void *s1)
-{
-        g_object_set(G_OBJECT(d), s0, s1, NULL);
-}
-
-static void bin_add_many(void *bin, void *v0, void *v1, void *v2)
-{
-        gst_bin_add_many(GST_BIN(bin), v0, v1, v2, NULL);
-}
 static GstBus *pipeline_get_bus(void *pipeline)
 {
         return gst_pipeline_get_bus(GST_PIPELINE(pipeline));
 }
 
-static void element_link_many(void *source, void *decoder, void *sink)
-{
-        gst_element_link_many(source, decoder, sink, NULL);
-}
-
 static void bus_add_watch(void *bus, void *loop)
 {
         gst_bus_add_watch(bus, bus_call, loop);
+        gst_object_unref(bus);
 }
 
+static void set_path(void *play, gchar *path)
+{
+        g_object_set(G_OBJECT(play), "uri", path, NULL);
+}
 
 static void object_unref(void *pipeline)
 {
@@ -100,20 +71,33 @@ static void mp3_stop(void *pipeline)
         gst_element_set_state(pipeline, GST_STATE_NULL);
 }
 
+static void set_mute(void *play)
+{
+        g_object_set(G_OBJECT(play), "mute", FALSE, NULL);
+}
+
+static void set_volume(void *play, int vol)
+{
+        int ret = vol % 11;
+
+        g_object_set(G_OBJECT(play), "volume", ret/10.0, NULL);
+}
+
 */
 import "C"
 
 import (
-        "container/list"
-        "flag"
-        "fmt"
-        "math/rand"
-        "os"
-        "path/filepath"
-        "runtime/debug"
-        "sync"
-        "time"
-        "unsafe"
+	"bufio"
+	"container/list"
+	"flag"
+	"fmt"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"sync"
+	"time"
+	"unsafe"
 )
 
 const MP3_FILE_MAX = 10
@@ -121,281 +105,300 @@ const MP3_FILE_MAX = 10
 var g_list *list.List
 var g_wg *sync.WaitGroup
 var g_isOutOfOrder bool
+var g_volume_size int = 5
 
 func GString(s string) *C.gchar {
-        return (*C.gchar)(C.CString(s))
+	return (*C.gchar)(C.CString(s))
 }
 
-func GFree(s C.gpointer) {
-        C.g_free(s)
+func GFree(s unsafe.Pointer) {
+	C.g_free(C.gpointer(s))
 }
 
 func walkFunc(fpath string, info os.FileInfo, err error) error {
-        if info.IsDir() {
-                return nil
-        }
-        switch filepath.Ext(fpath) {
-        case ".mp3":
-        case ".wav":
-        case ".ogg":
-                /* v3 := GString("oggparse")
-                   defer GFree(C.gpointer(v3))
-                   v4 := GString("ogg-parser")
-                   defer GFree(C.gpointer(v4))
-                   decoder = C.gst_element_factory_make(v3, v4) */
-                fallthrough
-        default:
-                return nil
-        }
+	if info.IsDir() {
+		return nil
+	}
+	switch filepath.Ext(fpath) {
+	case ".mp3", ".wav", ".ogg", ".wma", ".rmvb", ".mov":
+	default:
+		return nil
+	}
+	if x, err0 := filepath.Abs(fpath); err != nil {
+		err = err0
+		return err
+	} else {
+		p := fmt.Sprintf("file://%s", x)
+		g_list.PushBack(p)
+	}
 
-        g_list.PushBack(fpath)
-        return err
+	return err
 }
 
 func outOfOrder(l *list.List) {
-        iTotal := 5
-        ll := make([]*list.List, iTotal)
+	iTotal := 25
+	if iTotal > l.Len() {
+		iTotal = l.Len()
+	}
+	ll := make([]*list.List, iTotal)
 
-        for i := 0; i < iTotal; i++ {
-                ll[i] = list.New()
-        }
-        r := rand.New(rand.NewSource(time.Now().UnixNano()))
-        for e := l.Front(); e != nil; e = e.Next() {
-                fpath, ok := e.Value.(string)
-                if !ok {
-                        panic("The path is invalid string")
-                }
-                if rand.Int()%2 == 0 {
-                        ll[r.Intn(iTotal)].PushFront(fpath)
-                } else {
-                        ll[r.Intn(iTotal)].PushBack(fpath)
-                }
-        }
+	for i := 0; i < iTotal; i++ {
+		ll[i] = list.New()
+	}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for e := l.Front(); e != nil; e = e.Next() {
+		fpath, ok := e.Value.(string)
+		if !ok {
+			panic("The path is invalid string")
+		}
+		if rand.Int()%2 == 0 {
+			ll[r.Intn(iTotal)].PushFront(fpath)
+		} else {
+			ll[r.Intn(iTotal)].PushBack(fpath)
+		}
+	}
 
-        r0 := rand.New(rand.NewSource(time.Now().UnixNano()))
-        l.Init()
-        for i := 0; i < iTotal; i++ {
-                if r0.Intn(2) == 0 {
-                        l.PushBackList(ll[i])
-                } else {
-                        l.PushFrontList(ll[i])
-                }
-                ll[i].Init()
-        }
+	r0 := rand.New(rand.NewSource(time.Now().UnixNano()))
+	l.Init()
+	for i := 0; i < iTotal; i++ {
+		if r0.Intn(2) == 0 {
+			l.PushBackList(ll[i])
+		} else {
+			l.PushFrontList(ll[i])
+		}
+		ll[i].Init()
+	}
 }
 
-func mp3_play_process(cs chan byte, loop *C.GMainLoop) {
-        wg := new(sync.WaitGroup)
-        sig_in := make(chan bool)
-        sig_out := make(chan bool)
+func SinglePlayProcess(fpath string, loop *C.GMainLoop) {
+	// fmt.Printf("filename[%s]\n", fpath)
+	var pipeline *C.GstElement // 定义组件
+	var bus *C.GstBus
 
-        defer close(sig_in)
-        defer close(sig_out)
-        defer g_wg.Done()
-        if g_isOutOfOrder {
-                outOfOrder(g_list)
-                debug.FreeOSMemory()
-        }
-        start := g_list.Front()
-        end := g_list.Back()
-        e := g_list.Front()
+	switch t := filepath.Ext(fpath); t {
+	case ".mp3", ".wav", ".ogg", ".wma", ".rmvb", ".mov":
+	default:
+		fmt.Printf("不支持此文件格式[%s]\n", t)
+		return
+	}
 
-        for {
-                fpath, ok := e.Value.(string)
-                if ok {
-                        // fmt.Printf("filename[%s]\n", fpath)
-                        var pipeline, source, decoder, sink *C.GstElement // 定义组件
-                        var bus *C.GstBus
+	v0 := GString("playbin")
+	v1 := GString("play")
+	pipeline = C.gst_element_factory_make(v0, v1)
+	GFree(unsafe.Pointer(v0))
+	GFree(unsafe.Pointer(v1))
+	v2 := GString(fpath)
+	C.set_path(unsafe.Pointer(pipeline), v2)
+	GFree(unsafe.Pointer(v2))
 
-                        switch filepath.Ext(fpath) {
-                        case ".mp3":
-                                v3 := GString("mad")
-                                v4 := GString("mad-decoder")
-                                decoder = C.gst_element_factory_make(v3, v4)
-                                GFree(C.gpointer(v4))
-                                GFree(C.gpointer(v3))
-                        case ".wav":
-                                v3 := GString("wavparse")
-                                v4 := GString("parser")
-                                decoder = C.gst_element_factory_make(v3, v4)
-                                GFree(C.gpointer(v3))
-                                GFree(C.gpointer(v4))
-                        case ".ogg":
-                                // v3 := GString("oggparse")
-                                // defer GFree(C.gpointer(v3))
-                                // v4 := GString("ogg-parser")
-                                // defer GFree(C.gpointer(v4))
-                                // decoder = C.gst_element_factory_make(v3, v4)
-                                fallthrough
-                        default:
-                                return
-                        }
+	// 得到 管道的消息总线
+	bus = C.pipeline_get_bus(unsafe.Pointer(pipeline))
+	if bus == (*C.GstBus)(nil) {
+		fmt.Println("GstBus element could not be created.Exiting.")
+		return
+	}
+	C.bus_add_watch(unsafe.Pointer(bus), unsafe.Pointer(loop))
 
-                        // fmt.Printf("FileName[%s]FileSize[%d]Dir[%v]\n", path, info.Size(), info.IsDir())
+	C.mp3_ready(unsafe.Pointer(pipeline))
+	C.mp3_play(unsafe.Pointer(pipeline))
 
-                        // 创建管道和组件
-                        v0 := GString("audio-player")
-                        pipeline = C.gst_pipeline_new(v0)
-                        GFree(C.gpointer(v0))
-                        v1 := GString("filesrc")
-                        v2 := GString("file-source")
-                        source = C.gst_element_factory_make(v1, v2)
-                        GFree(C.gpointer(v1))
-                        GFree(C.gpointer(v2))
+	// 开始循环
+	C.g_main_loop_run(loop)
+	C.mp3_stop(unsafe.Pointer(pipeline))
+	C.object_unref(unsafe.Pointer(pipeline))
+}
 
-                        // sink = gst_element_factory_make("autoaudiosink","audio-output");
-                        v5 := GString("alsasink")
-                        v6 := GString("alsa-output")
-                        sink = C.gst_element_factory_make(v5, v6)
-                        GFree(C.gpointer(v6))
-                        GFree(C.gpointer(v5))
-                        if pipeline == (*C.GstElement)(nil) ||
-                                source == (*C.GstElement)(nil) ||
-                                decoder == (*C.GstElement)(nil) ||
-                                sink == (*C.GstElement)(nil) {
-                                fmt.Println("One element could not be created.Exiting.")
-                        }
+func PlayProcess(cs chan byte, loop *C.GMainLoop) {
+	wg := new(sync.WaitGroup)
+	sig_out := make(chan bool)
 
-                        // 设置 source的location 参数。即 文件地址.
-                        v7 := GString("location")
-                        cpath := GString(fpath)
-                        C.obj_set(unsafe.Pointer(source),
-                                unsafe.Pointer(v7), unsafe.Pointer(cpath))
-                        GFree(C.gpointer(v7))
-                        GFree(C.gpointer(cpath))
+	defer close(sig_out)
+	defer g_wg.Done()
+	if g_isOutOfOrder {
+		outOfOrder(g_list)
+		debug.FreeOSMemory()
+	}
 
-                        // 得到 管道的消息总线
-                        bus = C.pipeline_get_bus(unsafe.Pointer(pipeline))
-                        if bus == (*C.GstBus)(nil) {
-                                fmt.Println("GstBus element could not be created.Exiting.")
-                                return
-                        }
+	start := g_list.Front()
+	end := g_list.Back()
+	e := g_list.Front()
 
-                        // 添加消息监视器
-                        C.bus_add_watch(unsafe.Pointer(bus), unsafe.Pointer(loop))
-                        C.gst_object_unref(C.gpointer(bus))
+	for {
+		fpath, ok := e.Value.(string)
+		if ok {
+			// fmt.Printf("filename[%s]\n", fpath)
+			var pipeline *C.GstElement // 定义组件
+			var bus *C.GstBus
 
-                        // 把组件添加到管道中.管道是一个特殊的组件，可以更好的让数据流动
-                        C.bin_add_many(unsafe.Pointer(pipeline),
-                                unsafe.Pointer(source), unsafe.Pointer(decoder),
-                                unsafe.Pointer(sink))
+			v0 := GString("playbin")
+			v1 := GString("play")
+			pipeline = C.gst_element_factory_make(v0, v1)
+			GFree(unsafe.Pointer(v0))
+			GFree(unsafe.Pointer(v1))
+			v2 := GString(fpath)
+			C.set_path(unsafe.Pointer(pipeline), v2)
+			GFree(unsafe.Pointer(v2))
 
-                        // 依次连接组件
-                        C.element_link_many(unsafe.Pointer(source),
-                                unsafe.Pointer(decoder), unsafe.Pointer(sink))
+			// 得到 管道的消息总线
+			bus = C.pipeline_get_bus(unsafe.Pointer(pipeline))
+			if bus == (*C.GstBus)(nil) {
+				fmt.Println("GstBus element could not be created.Exiting.")
+				return
+			}
+			C.bus_add_watch(unsafe.Pointer(bus), unsafe.Pointer(loop))
 
-                        // 开始播放
-                        C.mp3_ready(unsafe.Pointer(pipeline))
-                        C.mp3_play(unsafe.Pointer(pipeline))
+			C.mp3_ready(unsafe.Pointer(pipeline))
+			C.mp3_play(unsafe.Pointer(pipeline))
+			C.set_mute(unsafe.Pointer(pipeline))
+			fmt.Printf("Playing %s\n", filepath.Base(fpath))
+			wg.Add(1)
+			go func(p *C.GstElement) {
+				defer wg.Done()
+				// 开始循环
+				C.g_main_loop_run(loop)
+				C.mp3_stop(unsafe.Pointer(p))
+				C.object_unref(unsafe.Pointer(p))
 
-                        wg.Add(1)
-                        go func() {
-                                defer wg.Done()
-                                // 开始循环
-                                C.g_main_loop_run(loop)
-                                C.mp3_stop(unsafe.Pointer(pipeline))
-                                C.object_unref(unsafe.Pointer(pipeline))
+				e = e.Next()
+				if e == nil {
+					sig_out <- true
+				} else {
+					sig_out <- false
+				}
 
-                                select {
-                                case c := <-sig_in:
-                                        if c {
-                                                return
-                                        }
-                                default:
-                                        e = e.Next()
-                                        if e == nil {
-                                                sig_out <- true
-                                                return
-                                        }
-                                }
-                                sig_out <- false
-                        }()
-                        lb := true
-                        for lb {
-                                select {
-                                case op := <-cs:
-                                        switch op {
-                                        case 's':
-                                                C.mp3_pause(unsafe.Pointer(pipeline))
-                                        case 'r':
-                                                C.mp3_play(unsafe.Pointer(pipeline))
-                                        case 'n':
-                                                if e != end {
-                                                        e = e.Next()
-                                                }
-                                                C.g_main_loop_quit(loop)
-                                                sig_in <- false
-                                        case 'p':
-                                                if e != start {
-                                                        e = e.Prev()
-                                                }
-                                                C.g_main_loop_quit(loop)
-                                                sig_in <- false
-                                        case 'q':
-                                                C.g_main_loop_quit(loop)
-                                                sig_in <- true
-                                                wg.Wait()
-                                                return
-                                        }
-                                case c := <-sig_out:
-                                        if c {
-                                                return
-                                        } else {
-                                                lb = false
-                                        }
-                                }
-                        }
-                        wg.Wait()
-                }
+			}(pipeline)
+			lb := true
+			for lb {
+				select {
+				case op := <-cs:
+					switch op {
+					case 's':
+						C.mp3_pause(unsafe.Pointer(pipeline))
+					case 'r':
+						C.mp3_play(unsafe.Pointer(pipeline))
+					case 'n':
+						if e != end {
+							e = e.Next()
+						}
+						C.g_main_loop_quit(loop)
+					case 'p':
+						if e != start {
+							e = e.Prev()
+						}
+						C.g_main_loop_quit(loop)
+					case 'q':
+						C.g_main_loop_quit(loop)
+						<-sig_out
+						wg.Wait()
+						return
+					case '+':
+						g_volume_size++
+						C.set_volume(unsafe.Pointer(pipeline), C.int(g_volume_size))
+					case '-':
+						g_volume_size--
+						if g_volume_size < 0 {
+							g_volume_size = 0
+						}
+						C.set_volume(unsafe.Pointer(pipeline), C.int(g_volume_size))
+					}
+				case c := <-sig_out:
+					if c {
+						wg.Wait()
+						return
+					} else {
+						lb = false
+					}
+				}
+			}
+			wg.Wait()
+			fmt.Printf("Finished play %s\n", filepath.Base(fpath))
+		} else {
+			// 路径非法
+			return
+		}
 
-        }
+	}
 }
 
 func main() {
-        var loop *C.GMainLoop
-        var s0 byte
-        mdir := ""
+	var loop *C.GMainLoop
+	mdir := ""
+	mfile := ""
 
-        flag.StringVar(&mdir, "mdir", "", "mp3文件目录")
-        flag.BoolVar(&g_isOutOfOrder, "rand", false, "是否乱序播放")
-        flag.Parse()
+	flag.StringVar(&mdir, "dir", "", "mp3文件目录")
+	flag.StringVar(&mfile, "file", "", "mp3文件")
+	flag.BoolVar(&g_isOutOfOrder, "rand", false, "是否乱序播放")
+	flag.Parse()
 
-        if mdir == "" {
-                flag.PrintDefaults()
-                return
-        }
-        g_list = list.New()
-        g_wg = new(sync.WaitGroup)
-        C.gst_init((*C.int)(unsafe.Pointer(nil)),
-                (***C.char)(unsafe.Pointer(nil)))
-        loop = C.g_main_loop_new((*C.GMainContext)(unsafe.Pointer(nil)),
-                C.gboolean(0)) // 创建主循环，在执行 g_main_loop_run后正式开始循环
+	if mfile != "" {
+		p, err := filepath.Abs(mfile)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return
+		}
+		C.gst_init((*C.int)(unsafe.Pointer(nil)),
+			(***C.char)(unsafe.Pointer(nil)))
+		loop = C.g_main_loop_new((*C.GMainContext)(unsafe.Pointer(nil)),
+			C.gboolean(0)) // 创建主循环，在执行 g_main_loop_run后正式开始循环
+		mfile = fmt.Sprintf("file://%s", p)
 
-        if err := filepath.Walk(mdir, walkFunc); err != nil {
-                fmt.Printf("Error: %v\n", err)
-                return
-        }
-        g_wg.Add(1)
-        s := make(chan byte)
-        defer close(s)
-        go mp3_play_process(s, loop)
-LOOP0:
-        for {
-                fmt.Fscanf(os.Stdin, "%c\n", &s0)
-                switch s0 {
-                case 's':
-                        s <- s0
-                case 'r':
-                        s <- s0
-                case 'n':
-                        s <- s0
-                case 'p':
-                        s <- s0
-                case 'q':
-                        s <- s0
-                        break LOOP0
-                }
-                s0 = 0
-        }
-        g_wg.Wait()
+		SinglePlayProcess(mfile, loop)
+		return
+	}
+	if mdir == "" {
+		flag.PrintDefaults()
+		return
+	}
+	g_list = list.New()
+	g_wg = new(sync.WaitGroup)
+	C.gst_init((*C.int)(unsafe.Pointer(nil)),
+		(***C.char)(unsafe.Pointer(nil)))
+	loop = C.g_main_loop_new((*C.GMainContext)(unsafe.Pointer(nil)),
+		C.gboolean(0)) // 创建主循环，在执行 g_main_loop_run后正式开始循环
+
+	if err := filepath.Walk(mdir, walkFunc); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	g_wg.Add(1)
+	s := make(chan byte)
+	defer close(s)
+	go PlayProcess(s, loop)
+	go func() {
+		rd := bufio.NewReader(os.Stdin)
+	LOOP0:
+		for {
+			s0, err := rd.ReadByte()
+			if err != nil {
+				fmt.Printf("%v\n", err)
+			}
+			//fmt.Fscanf(os.Stdin, "%c\n", &s0)
+			switch s0 {
+			case 's':
+				s <- s0
+			case 'r':
+				s <- s0
+			case 'n':
+				s <- s0
+			case 'p':
+				s <- s0
+			case 'q':
+				s <- s0
+				break LOOP0
+			case 'h':
+				fmt.Print("'s' -> 暂停\n" +
+					"'r' -> 继续\n" +
+					"'n' -> 下一首\n" +
+					"'p' -> 上一首\n" +
+					"'q' -> 退出\n")
+			case '+':
+				s <- '+'
+			case '-':
+				s <- '-'
+			}
+			s0 = 0
+		}
+
+	}()
+	g_wg.Wait()
 }
